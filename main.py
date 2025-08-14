@@ -4,32 +4,27 @@ from fastapi.middleware.cors import CORSMiddleware
 from tempfile import NamedTemporaryFile
 import os
 import cv2
-from ultralytics import YOLO
 
 app = FastAPI()
 
-# Global model placeholder (lazy load)
-model = None
-
-# Healthcheck endpoint
-@app.get("/health")
-def health():
-    return JSONResponse({"status": "ok"})
-
-# CORS configuration
+# Allow frontend CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:3000",
-        "https://7ddd95.csb.app/"
-    ],
+    allow_origins=["http://localhost:3000", "https://7ddd95.csb.app/"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
+# Healthcheck endpoint - responds instantly
+@app.get("/health")
+def health():
+    return JSONResponse({"status": "ok"})
+
+# Lazy model load (None until first request)
+model = None
+
 def remove_file(path: str):
-    """Background task to clean up temporary files."""
     try:
         os.remove(path)
     except FileNotFoundError:
@@ -38,16 +33,12 @@ def remove_file(path: str):
 @app.post("/upload_video")
 def upload_video(background_tasks: BackgroundTasks, file: UploadFile = File(...)):
     global model
-
-    # Lazy-load YOLO model to avoid slowing startup
     if model is None:
-        try:
-            model = YOLO("yolov8n.pt")
-            print("YOLO model loaded successfully.")
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Error loading YOLO model: {e}")
+        from ultralytics import YOLO
+        model = YOLO("yolov8n.pt")
+        print("YOLO model loaded.")
 
-    # Validate extension
+    # Validate file extension
     if not file.filename.lower().endswith(('.mp4', '.avi', '.mov')):
         raise HTTPException(status_code=400, detail="Invalid video file format")
 
@@ -61,7 +52,7 @@ def upload_video(background_tasks: BackgroundTasks, file: UploadFile = File(...)
     finally:
         file.file.close()
 
-    # Open with FFmpeg backend
+    # Open video file
     cap = cv2.VideoCapture(input_path, cv2.CAP_FFMPEG)
     if not cap.isOpened():
         os.remove(input_path)
@@ -70,20 +61,15 @@ def upload_video(background_tasks: BackgroundTasks, file: UploadFile = File(...)
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     fps = cap.get(cv2.CAP_PROP_FPS) or 24.0
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    print(f"Video: {width}x{height} @ {fps} FPS, frames={total_frames}")
-
     if width <= 0 or height <= 0:
         cap.release()
         os.remove(input_path)
         raise HTTPException(status_code=500, detail="Invalid video dimensions")
 
-    # Create output temp file
     output_temp = NamedTemporaryFile(delete=False, suffix=".mp4")
     output_temp.close()
     output_path = output_temp.name
 
-    # Use mp4v for CPU compatibility
     fourcc = cv2.VideoWriter_fourcc(*'mp4v')
     out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
     if not out.isOpened():
@@ -104,20 +90,10 @@ def upload_video(background_tasks: BackgroundTasks, file: UploadFile = File(...)
 
         if frame_count == 0:
             raise RuntimeError("No frames processed")
-        print(f"Processed {frame_count} frames")
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error processing video: {e}")
     finally:
         cap.release()
         out.release()
         os.remove(input_path)
 
-    # Schedule cleanup of output file
     background_tasks.add_task(remove_file, output_path)
-
-    return FileResponse(
-        output_path,
-        media_type="video/mp4",
-        filename="processed_video.mp4",
-        headers={"Content-Disposition": "attachment; filename=processed_video.mp4"}
-    )
+    return FileResponse(output_path, media_type="video/mp4", filename="processed_video.mp4")
