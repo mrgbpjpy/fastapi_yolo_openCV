@@ -1,49 +1,26 @@
-# main.py
 import os
 import uuid
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Optional, Literal
-
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import JSONResponse, PlainTextResponse
+from fastapi import FastAPI, HTTPException, UploadFile, File
+from fastapi.responses import JSONResponse, PlainTextResponse, FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, validator
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Perf & safety knobs (set BEFORE heavy imports)
-# ──────────────────────────────────────────────────────────────────────────────
-os.environ.setdefault("ULTRALYTICS_NOAUTOINSTALL", "1")  # no pip at runtime
-os.environ.setdefault("OMP_NUM_THREADS", "1")
+# Performance and safety configurations
+os.environ.setdefault("ULTRALYTICS_NOAUTOINSTALL", "1")  # Prevent pip installs at runtime
+os.environ.setdefault("OMP_NUM_THREADS", "1")  # Limit threads for CPU efficiency
 os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
 os.environ.setdefault("MKL_NUM_THREADS", "1")
 os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Optional S3 setup (do not fail import/startup)
-# ──────────────────────────────────────────────────────────────────────────────
-AWS_REGION = os.getenv("AWS_REGION")
-S3_BUCKET = os.getenv("S3_BUCKET")
-S3_PREFIX = (os.getenv("S3_PREFIX") or "").strip("/")
-
-try:
-    import boto3  # type: ignore
-    s3 = boto3.client("s3", region_name=AWS_REGION) if AWS_REGION else None
-except Exception as e:
-    print(f"[boot] boto3 unavailable: {e}")
-    boto3 = None  # type: ignore
-    s3 = None
-
-# ──────────────────────────────────────────────────────────────────────────────
-# App & CORS
-# ──────────────────────────────────────────────────────────────────────────────
+# FastAPI app setup with CORS
 ALLOWED_ORIGINS = [
     "https://7ddd95.csb.app",
     "http://localhost:3000",
 ]
-
 app = FastAPI(title="YOLOv8 Large Video Pipeline")
-
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
@@ -52,9 +29,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Health / Root (must be trivial for Railway healthcheck)
-# ──────────────────────────────────────────────────────────────────────────────
+# Health and root endpoints for Railway healthcheck
 @app.get("/health")
 def health():
     return JSONResponse({"status": "ok"})
@@ -63,59 +38,35 @@ def health():
 def root():
     return {"status": "ok"}
 
-# Explicit preflights (helps some proxies/CDNs)
-@app.options("/presign-upload")
+# Explicit preflight responses for CORS compatibility
+@app.options("/upload-and-process")
 def _opt1():
     return PlainTextResponse("", status_code=200)
 
-@app.options("/process_s3")
-def _opt2():
-    return PlainTextResponse("", status_code=200)
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Schemas
-# ──────────────────────────────────────────────────────────────────────────────
-class PresignResponse(BaseModel):
-    uploadUrl: str
-    key: str
-
+# Schemas for request and response
 class ProcessRequest(BaseModel):
-    key: str = Field(..., description="S3 key of the uploaded source video")
-    imgsz: int = Field(320, ge=128, le=1280)
-    vid_stride: int = Field(2, ge=1, le=10)
-    conf: float = Field(0.30, ge=0.05, le=0.95)
-    iou: float = Field(0.45, ge=0.1, le=0.9)
+    imgsz: int = Field(320, ge=128, le=1280, description="Image size for YOLO processing")
+    vid_stride: int = Field(2, ge=1, le=10, description="Video frame stride")
+    conf: float = Field(0.30, ge=0.05, le=0.95, description="Confidence threshold")
+    iou: float = Field(0.45, ge=0.1, le=0.9, description="IoU threshold")
     classes: Optional[list[int]] = Field(None, description="Optional class IDs filter")
-    tracker: Literal["bytetrack.yaml"] = "bytetrack.yaml"  # avoids lapx
-
-    @validator("key")
-    def _not_empty(cls, v: str) -> str:
-        if not isinstance(v, str) or not v.strip():
-            raise ValueError("key must be a non-empty string")
-        return v
+    tracker: Literal["bytetrack.yaml"] = "bytetrack.yaml"  # Use ByteTrack
 
 class ProcessResponse(BaseModel):
-    videoUrl: str
-    processedKey: str
+    videoPath: str  # Path to processed video
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Lazy YOLO (no heavy work at import time)
-# ──────────────────────────────────────────────────────────────────────────────
+# Lazy-load YOLO model to avoid heavy imports at startup
 _model = None
 def get_model():
-    """
-    Lazy-load YOLO and clamp thread usage for small CPU instances.
-    """
     global _model
     if _model is None:
-        from ultralytics import YOLO  # heavy import only when first needed
-        _model = YOLO("yolov8n.pt")   # nano = fastest on CPU
+        from ultralytics import YOLO
+        _model = YOLO("yolov8n.pt")  # Use nano model for CPU speed
         try:
             _model.fuse()
         except Exception:
             pass
-
-        # Clamp threads in libs to keep instance responsive
+        # Clamp threads for responsiveness
         try:
             import torch
             torch.set_num_threads(1)
@@ -131,85 +82,62 @@ def get_model():
                 pass
         except Exception:
             pass
-
         print("[boot] YOLO ready")
     return _model
 
-# ──────────────────────────────────────────────────────────────────────────────
-# 1) Presign PUT URL for direct browser upload to S3
-# ──────────────────────────────────────────────────────────────────────────────
-@app.get("/presign-upload", response_model=PresignResponse)
-def presign_upload(ext: str = "mp4"):
-    if ext.lower() not in {"mp4", "mov", "avi", "mkv"}:
+# Endpoint to upload and process video directly
+@app.post("/upload-and-process", response_model=ProcessResponse)
+async def upload_and_process(
+    file: UploadFile = File(...),
+    imgsz: int = 320,
+    vid_stride: int = 2,
+    conf: float = 0.30,
+    iou: float = 0.45,
+    classes: Optional[list[int]] = None,
+    tracker: str = "bytetrack.yaml"
+):
+    # Validate file extension
+    ext = (file.filename.split(".")[-1] if file.filename else "mp4").lower()
+    if ext not in {"mp4", "mov", "avi", "mkv"}:
         raise HTTPException(status_code=400, detail="Unsupported video extension")
-    if not (S3_BUCKET and AWS_REGION and s3):
-        raise HTTPException(
-            status_code=500,
-            detail="S3 is not configured (AWS_REGION/S3_BUCKET or boto3 missing).",
-        )
 
-    key = f"{S3_PREFIX + '/' if S3_PREFIX else ''}uploads/{uuid.uuid4()}.{ext.lower()}"
-    try:
-        url = s3.generate_presigned_url(
-            ClientMethod="putObject",
-            Params={
-                "Bucket": S3_BUCKET,
-                "Key": key,
-                # Use a safe default; browsers will still upload MOV/AVI fine
-                "ContentType": "video/mp4",
-            },
-            ExpiresIn=15 * 60,  # 15 minutes
-        )
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to create presigned URL: {e}")
-
-    return PresignResponse(uploadUrl=url, key=key)
-
-# ──────────────────────────────────────────────────────────────────────────────
-# 2) Download from S3 → YOLO track → upload to S3 → return presigned GET
-# ──────────────────────────────────────────────────────────────────────────────
-@app.post("/process_s3", response_model=ProcessResponse)
-def process_s3(req: ProcessRequest):
-    if not (S3_BUCKET and AWS_REGION and s3):
-        raise HTTPException(
-            status_code=500,
-            detail="S3 is not configured (AWS_REGION/S3_BUCKET or boto3 missing).",
-        )
-
+    # Create temporary directory for processing
     with TemporaryDirectory() as workdir:
         work = Path(workdir)
-        in_path = work / "input.mp4"
+        in_path = work / f"input.{ext}"
         out_base = work / "runs"
 
-        # 1) Download the uploaded source from S3
+        # Save uploaded file
         try:
-            s3.download_file(S3_BUCKET, req.key, str(in_path))
+            with in_path.open("wb") as f:
+                content = await file.read()
+                f.write(content)
         except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Failed to download from S3: {e}")
+            raise HTTPException(status_code=500, detail=f"Failed to save uploaded file: {e}")
 
-        # 2) Run YOLO tracking (Ultralytics internal video pipeline is fastest)
+        # Run YOLO tracking
         model = get_model()
         try:
             model.track(
                 source=str(in_path),
-                save=True,                 # write annotated video
-                stream=False,              # run to completion
-                project=str(out_base),     # base dir
-                name="out",                # subfolder
+                save=True,  # Save annotated video
+                stream=False,  # Run to completion
+                project=str(out_base),  # Output directory
+                name="out",  # Subfolder
                 exist_ok=True,
                 device="cpu",
-                tracker=req.tracker,       # ByteTrack (no lapx)
-                imgsz=req.imgsz,
-                vid_stride=req.vid_stride,
-                conf=req.conf,
-                iou=req.iou,
-                classes=req.classes,
+                tracker=tracker,
+                imgsz=imgsz,
+                vid_stride=vid_stride,
+                conf=conf,
+                iou=iou,
+                classes=classes,
                 verbose=False,
             )
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"Error during tracking: {e}")
 
-        # 3) Locate produced video
+        # Locate processed video
         out_root = out_base / "out"
         produced = None
         for ext in (".mp4", ".mov", ".avi", ".mkv"):
@@ -220,21 +148,17 @@ def process_s3(req: ProcessRequest):
         if not produced:
             raise HTTPException(status_code=500, detail="Processed video not found")
 
-        # 4) Upload processed video to S3
-        processed_key = f"{S3_PREFIX + '/' if S3_PREFIX else ''}processed/{uuid.uuid4()}.mp4"
-        try:
-            s3.upload_file(str(produced), S3_BUCKET, processed_key, ExtraArgs={"ContentType": "video/mp4"})
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Upload processed video failed: {e}")
+        # Move processed video to a persistent location (Railway ephemeral storage workaround)
+        processed_path = Path(f"/app/processed/{uuid.uuid4()}.mp4")
+        processed_path.parent.mkdir(exist_ok=True)
+        processed_path.write(produced.read_bytes())
 
-    # 5) Return presigned GET for the browser to stream/download
-    try:
-        get_url = s3.generate_presigned_url(
-            ClientMethod="getObject",
-            Params={"Bucket": S3_BUCKET, "Key": processed_key},
-            ExpiresIn=60 * 60,  # 1 hour
-        )
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to create presigned GET URL: {e}")
+    return ProcessResponse(videoPath=str(processed_path))
 
-    return ProcessResponse(videoUrl=get_url, processedKey=processed_key)
+# Serve processed video
+@app.get("/processed/{video_id}")
+async def serve_processed(video_id: str):
+    video_path = Path(f"/app/processed/{video_id}.mp4")
+    if not video_path.exists():
+        raise HTTPException(status_code=404, detail="Video not found")
+    return FileResponse(video_path, media_type="video/mp4")
