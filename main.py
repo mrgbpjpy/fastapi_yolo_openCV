@@ -1,14 +1,24 @@
+# ---- hardening & perf before any heavy imports ----
+import os
+# Stop Ultralytics from pip-installing at runtime (e.g., lapx)
+os.environ.setdefault("ULTRALYTICS_NOAUTOINSTALL", "1")
+# Keep CPU thread usage sane on small Railway CPUs
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
+os.environ.setdefault("UVICORN_WORKERS", "1")  # belt & suspenders
+
 from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
 from fastapi.middleware.cors import CORSMiddleware
 from tempfile import TemporaryDirectory
 from pathlib import Path
-import os
 import shutil
 
 app = FastAPI(title="YOLOv8 Video Processor")
 
-# --- CORS (no trailing slash) ---
+# ---------- CORS ----------
 ALLOWED_ORIGINS = ["https://7ddd95.csb.app", "http://localhost:3000"]
 app.add_middleware(
     CORSMiddleware,
@@ -18,6 +28,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# ---------- health & root ----------
 @app.get("/health")
 def health():
     return JSONResponse({"status": "ok"})
@@ -31,37 +42,56 @@ def root():
 def options_upload_video():
     return PlainTextResponse("", status_code=200)
 
-# --- Lazy model ---
+# ---------- lazy model + perf tuning ----------
 _model = None
 def get_model():
     global _model
     if _model is None:
+        # lazy import to keep startup instant
         from ultralytics import YOLO
-        _model = YOLO("yolov8n.pt")  # nano for speed
-        # Optional: fuse for a tiny CPU boost
+        _model = YOLO("yolov8n.pt")  # nano model -> fastest
         try:
-            _model.fuse()
+            _model.fuse()  # small CPU boost
         except Exception:
             pass
-        print("YOLO loaded")
+
+        # Also limit threads inside the process libs after import
+        try:
+            import torch
+            torch.set_num_threads(1)
+            torch.set_num_interop_threads(1)
+        except Exception:
+            pass
+        try:
+            import cv2
+            cv2.setNumThreads(1)
+            try:
+                cv2.ocl.setUseOpenCL(False)
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+        print("YOLO loaded (no auto-install).")
     return _model
 
-# --- Main endpoint: use Ultralytics pipeline to read/track/write ---
+# ---------- video endpoint (Ultralytics pipeline) ----------
 @app.post("/upload_video")
 def upload_video(file: UploadFile = File(...)):
-    # Very light validation
-    name = (file.filename or "video.mp4").lower()
-    if not name.endswith((".mp4", ".mov", ".avi", ".mkv")):
+    # Basic filename check
+    name = (file.filename or "video.mp4")
+    lower = name.lower()
+    if not lower.endswith((".mp4", ".mov", ".avi", ".mkv")):
         raise HTTPException(400, "Invalid video file format")
 
-    # Create a throwaway working dir per request
+    # Work in a throwaway directory and then move the result to a stable temp path
     with TemporaryDirectory() as workdir:
         work = Path(workdir)
-        in_path = work / "input" / name
-        out_dir = work / "runs"   # Ultralytics will write under project/name/*
-        in_path.parent.mkdir(parents=True, exist_ok=True)
+        in_dir = work / "input"
+        out_dir = work / "runs"
+        in_dir.mkdir(parents=True, exist_ok=True)
 
-        # Save upload
+        in_path = in_dir / name
         try:
             in_bytes = file.file.read()
             in_path.write_bytes(in_bytes)
@@ -73,43 +103,44 @@ def upload_video(file: UploadFile = File(...)):
             except Exception:
                 pass
 
-        # Run tracking internally (ByteTrack = no lapx dependency)
         model = get_model()
+
+        # Use Ultralytics' internal video IO for speed; force ByteTrack to avoid lapx
         try:
             model.track(
                 source=str(in_path),
-                stream=False,            # let it run and write outputs
-                save=True,               # write annotated video
-                project=str(out_dir),    # where to write
+                save=True,               # write annotated video to disk
+                stream=False,            # run to completion
+                project=str(out_dir),    # base output dir
                 name="out",              # subfolder
                 exist_ok=True,
-                imgsz=320,               # reduce pixels -> faster CPU
-                vid_stride=2,            # process every 2nd frame
-                conf=0.25,               # tweak as needed
-                iou=0.45,
                 device="cpu",
-                tracker="bytetrack.yaml" # avoid OCSORT -> no lapx at runtime
+                tracker="bytetrack.yaml",# <- avoids lapx (OCSORT) dependency
+                imgsz=320,               # smaller -> faster CPU
+                vid_stride=2,            # process every 2nd frame
+                conf=0.30,
+                iou=0.45,
+                verbose=False,
             )
         except Exception as e:
-            # If something goes wrong inside Ultralytics
+            # If Ultralytics tries to auto-install, our env flag will prevent it and raise
             raise HTTPException(500, f"Error during tracking: {e}")
 
-        # Find the produced video (Ultralytics mirrors input name)
+        # Locate output (Ultralytics mirrors input filename under runs/out/)
         out_root = out_dir / "out"
-        # pick the first mp4/mov/avi in output
-        candidates = list(out_root.rglob("*.mp4")) + list(out_root.rglob("*.mov")) + list(out_root.rglob("*.avi"))
+        candidates = []
+        for ext in ("*.mp4", "*.mov", "*.avi", "*.mkv"):
+            candidates += list(out_root.rglob(ext))
         if not candidates:
             raise HTTPException(500, "Failed to locate processed video output")
+        produced = candidates[0]
 
-        produced = candidates[0]  # usually runs/out/<filename>.mp4
-
-        # Move it to a stable temp path outside the context manager
-        final_tmp = Path(TemporaryDirectory().name)  # a new temp folder
-        final_tmp.mkdir(parents=True, exist_ok=True)
-        final_path = final_tmp / "processed_video.mp4"
+        # Move to a stable temp file (outside context manager) so FileResponse can stream it
+        final_dir = Path(TemporaryDirectory().name)
+        final_dir.mkdir(parents=True, exist_ok=True)
+        final_path = final_dir / "processed_video.mp4"
         shutil.move(str(produced), final_path)
 
-    # Return file; tmp dir holding final_path lives until process cleans it
     return FileResponse(
         str(final_path),
         media_type="video/mp4",
