@@ -1,12 +1,14 @@
-from fastapi import FastAPI, File, UploadFile, HTTPException, BackgroundTasks
+from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
 from fastapi.middleware.cors import CORSMiddleware
-from tempfile import NamedTemporaryFile
+from tempfile import TemporaryDirectory
+from pathlib import Path
 import os
+import shutil
 
 app = FastAPI(title="YOLOv8 Video Processor")
 
-# --- CORS (note: no trailing slash) ---
+# --- CORS (no trailing slash) ---
 ALLOWED_ORIGINS = ["https://7ddd95.csb.app", "http://localhost:3000"]
 app.add_middleware(
     CORSMiddleware,
@@ -16,7 +18,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# --- Health & root ---
 @app.get("/health")
 def health():
     return JSONResponse({"status": "ok"})
@@ -25,88 +26,93 @@ def health():
 def root():
     return {"status": "ok"}
 
-# --- Explicit preflight for picky proxies ---
+# Explicit preflight (some edges are picky)
 @app.options("/upload_video")
 def options_upload_video():
-    # CORSMiddleware will attach the Access-Control-* headers
     return PlainTextResponse("", status_code=200)
 
-# --- Lazy model holder ---
+# --- Lazy model ---
 _model = None
 def get_model():
     global _model
     if _model is None:
         from ultralytics import YOLO
-        _model = YOLO("yolov8n.pt")  # small + fast
+        _model = YOLO("yolov8n.pt")  # nano for speed
+        # Optional: fuse for a tiny CPU boost
+        try:
+            _model.fuse()
+        except Exception:
+            pass
         print("YOLO loaded")
     return _model
 
-def remove_file(path: str):
-    try:
-        os.remove(path)
-    except FileNotFoundError:
-        pass
-
-# --- Main endpoint ---
+# --- Main endpoint: use Ultralytics pipeline to read/track/write ---
 @app.post("/upload_video")
-def upload_video(background_tasks: BackgroundTasks, file: UploadFile = File(...)):
-    import cv2  # lazy import so startup is instant
+def upload_video(file: UploadFile = File(...)):
+    # Very light validation
+    name = (file.filename or "video.mp4").lower()
+    if not name.endswith((".mp4", ".mov", ".avi", ".mkv")):
+        raise HTTPException(400, "Invalid video file format")
 
-    # Basic filename check
-    if not file.filename.lower().endswith((".mp4", ".avi", ".mov")):
-        raise HTTPException(status_code=400, detail="Invalid video file format")
+    # Create a throwaway working dir per request
+    with TemporaryDirectory() as workdir:
+        work = Path(workdir)
+        in_path = work / "input" / name
+        out_dir = work / "runs"   # Ultralytics will write under project/name/*
+        in_path.parent.mkdir(parents=True, exist_ok=True)
 
-    # Save upload to temp
-    suffix = os.path.splitext(file.filename)[1] or ".mp4"
-    inp = NamedTemporaryFile(delete=False, suffix=suffix)
-    try:
-        inp.write(file.file.read())
-        inp.close()
-        in_path = inp.name
-    finally:
-        file.file.close()
+        # Save upload
+        try:
+            in_bytes = file.file.read()
+            in_path.write_bytes(in_bytes)
+        except Exception as e:
+            raise HTTPException(500, f"Error saving upload: {e}")
+        finally:
+            try:
+                file.file.close()
+            except Exception:
+                pass
 
-    # Open video
-    cap = cv2.VideoCapture(in_path, cv2.CAP_FFMPEG)
-    if not cap.isOpened():
-        os.remove(in_path)
-        raise HTTPException(status_code=500, detail="Error opening video file")
+        # Run tracking internally (ByteTrack = no lapx dependency)
+        model = get_model()
+        try:
+            model.track(
+                source=str(in_path),
+                stream=False,            # let it run and write outputs
+                save=True,               # write annotated video
+                project=str(out_dir),    # where to write
+                name="out",              # subfolder
+                exist_ok=True,
+                imgsz=320,               # reduce pixels -> faster CPU
+                vid_stride=2,            # process every 2nd frame
+                conf=0.25,               # tweak as needed
+                iou=0.45,
+                device="cpu",
+                tracker="bytetrack.yaml" # avoid OCSORT -> no lapx at runtime
+            )
+        except Exception as e:
+            # If something goes wrong inside Ultralytics
+            raise HTTPException(500, f"Error during tracking: {e}")
 
-    w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    fps = cap.get(cv2.CAP_PROP_FPS) or 24.0
-    if w <= 0 or h <= 0:
-        cap.release(); os.remove(in_path)
-        raise HTTPException(status_code=500, detail="Invalid video dimensions")
+        # Find the produced video (Ultralytics mirrors input name)
+        out_root = out_dir / "out"
+        # pick the first mp4/mov/avi in output
+        candidates = list(out_root.rglob("*.mp4")) + list(out_root.rglob("*.mov")) + list(out_root.rglob("*.avi"))
+        if not candidates:
+            raise HTTPException(500, "Failed to locate processed video output")
 
-    # Output temp file
-    out_tmp = NamedTemporaryFile(delete=False, suffix=".mp4")
-    out_tmp.close()
-    out_path = out_tmp.name
+        produced = candidates[0]  # usually runs/out/<filename>.mp4
 
-    # Writer (CPU-friendly)
-    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-    out = cv2.VideoWriter(out_path, fourcc, fps, (w, h))
-    if not out.isOpened():
-        cap.release(); os.remove(in_path)
-        raise HTTPException(status_code=500, detail="Error initializing video writer")
+        # Move it to a stable temp path outside the context manager
+        final_tmp = Path(TemporaryDirectory().name)  # a new temp folder
+        final_tmp.mkdir(parents=True, exist_ok=True)
+        final_path = final_tmp / "processed_video.mp4"
+        shutil.move(str(produced), final_path)
 
-    model = get_model()
-    frames = 0
-    try:
-        while True:
-            ret, frame = cap.read()
-            if not ret: break
-            results = model.track(frame, persist=True)
-            annotated = results[0].plot()
-            out.write(annotated)
-            frames += 1
-        if frames == 0:
-            raise RuntimeError("No frames processed")
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error processing video: {e}")
-    finally:
-        cap.release(); out.release(); os.remove(in_path)
-
-    background_tasks.add_task(remove_file, out_path)
-    return FileResponse(out_path, media_type="video/mp4", filename="processed_video.mp4")
+    # Return file; tmp dir holding final_path lives until process cleans it
+    return FileResponse(
+        str(final_path),
+        media_type="video/mp4",
+        filename="processed_video.mp4",
+        headers={"Content-Disposition": "attachment; filename=processed_video.mp4"},
+    )
