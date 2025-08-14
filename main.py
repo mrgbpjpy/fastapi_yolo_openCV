@@ -38,8 +38,12 @@ from botocore.config import Config
 # Docs: https://docs.python.org/3/library/logging.html
 import logging
 
-# Configure logging
+# Configure logging with INFO level
+# Docs: https://docs.python.org/3/library/logging.html#logging.basicConfig
 logging.basicConfig(level=logging.INFO)
+
+# Create a logger instance for this module
+# Docs: https://docs.python.org/3/library/logging.html#logging.getLogger
 logger = logging.getLogger(__name__)
 
 # ---------- perf/safety knobs ----------
