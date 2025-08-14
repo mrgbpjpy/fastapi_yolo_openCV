@@ -193,7 +193,7 @@ def get_model():
         # Import YOLO from ultralytics
         # Docs: https://docs.ultralytics.com/
         from ultralytics import YOLO
-        _model = YOLO("yolov8n.pt")
+        _model = YOLO("yolov8n.pt")  # Pre-trained on COCO dataset with 80 classes
         try:
             # Fuse the model for optimization
             # Docs: https://docs.ultralytics.com/modes/predict/#model-fusion
@@ -227,16 +227,42 @@ def get_model():
 def process_frame(frame, results):
     # Convert frame to numpy array if not already
     # Docs: https://numpy.org/doc/stable/reference/arrays.html
-    frame = np.array(frame) if not isinstance(frame, np.ndarray) else frame
-    # Draw bounding boxes and labels from YOLO results
-    # Docs: https://docs.ultralytics.com/modes/predict/#working-with-results
-    for box in results[0].boxes.xyxy:  # Access the first result's boxes
-        x1, y1, x2, y2 = map(int, box[:4])
-        cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)  # Green box
-        conf = results[0].boxes.conf[0]  # Confidence score
-        cls = int(results[0].boxes.cls[0])  # Class ID
-        label = f"Class {cls} ({conf:.2f})"
-        cv2.putText(frame, label, (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+    frame = np.array(frame) if not isinstance(frame, np.ndarray) else frame.copy()
+
+    # Define all 80 COCO class names for labeling
+    # Docs: https://github.com/ultralytics/ultralytics/blob/main/ultralytics/data/coco128.yaml
+    coco_classes = [
+        "person", "bicycle", "car", "motorcycle", "airplane", "bus", "train", "truck", "boat",
+        "traffic light", "fire hydrant", "stop sign", "parking meter", "bench", "bird", "cat",
+        "dog", "horse", "sheep", "cow", "elephant", "bear", "zebra", "giraffe", "backpack",
+        "umbrella", "handbag", "tie", "suitcase", "frisbee", "skis", "snowboard", "sports ball",
+        "kite", "baseball bat", "baseball glove", "skateboard", "surfboard", "tennis racket",
+        "bottle", "wine glass", "cup", "fork", "knife", "spoon", "bowl", "banana", "apple",
+        "sandwich", "orange", "broccoli", "carrot", "hot dog", "pizza", "donut", "cake", "chair",
+        "couch", "potted plant", "bed", "dining table", "toilet", "tv", "laptop", "mouse",
+        "remote", "keyboard", "cell phone", "microwave", "oven", "toaster", "sink", "refrigerator",
+        "book", "clock", "vase", "scissors", "teddy bear", "hair drier", "toothbrush"
+    ]
+
+    # Draw bounding boxes and labels from YOLO tracking results
+    # Docs: https://docs.ultralytics.com/modes/track/#track-results
+    if results and results[0].boxes and results[0].boxes.xyxy is not None:
+        for box, cls, conf in zip(results[0].boxes.xyxy, results[0].boxes.cls, results[0].boxes.conf):
+            x1, y1, x2, y2 = map(int, box[:4])
+            # Ensure class index is within valid range
+            # Docs: https://numpy.org/doc/stable/reference/arrays.indexing.html
+            cls_id = int(cls) if 0 <= int(cls) < len(coco_classes) else -1
+            class_name = coco_classes[cls_id] if cls_id >= 0 else f"Unknown_{cls_id}"
+            label = f"{class_name} ({conf:.2f})"
+            # Draw rectangle for the bounding box
+            # Docs: https://docs.opencv.org/4.x/d6/d6e/group__imgproc__draw.html
+            cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+            # Draw label text with background for readability
+            # Docs: https://docs.opencv.org/4.x/d6/d6e/group__imgproc__draw.html#ga5126f47c573f65d2a8c4d1daf0f26e2a
+            (text_width, text_height), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 2)
+            cv2.rectangle(frame, (x1, y1 - text_height - 10), (x1 + text_width + 6, y1), (0, 0, 0), -1)
+            cv2.putText(frame, label, (x1 + 2, y1 - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+
     return frame
 
 # 1) Presign a PUT for direct browser upload to R2
@@ -275,8 +301,8 @@ def process_s3(payload: dict):
     key = payload.get("key")
     if not key or not isinstance(key, str):
         raise HTTPException(status_code=400, detail="Missing S3 key")
-    imgsz = int(payload.get("imgsz", 320))
-    vid_stride = int(payload.get("vid_stride", 2))
+    imgsz = int(payload.get("imgsz", 640))  # Default to 640 for better detection
+    vid_stride = int(payload.get("vid_stride", 1))  # Process every frame by default
     s3 = get_s3()
     with TemporaryDirectory() as tmpd:
         tmp = Path(tmpd)
@@ -295,6 +321,8 @@ def process_s3(payload: dict):
             raise HTTPException(status_code=500, detail="Failed to open video file")
         fourcc = cv2.VideoWriter_fourcc(*'mp4v')
         fps = cap.get(cv2.CAP_PROP_FPS)
+        if not fps or fps <= 0:
+            fps = 24.0  # Fallback FPS if metadata is missing
         width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         out = cv2.VideoWriter(str(out_path), fourcc, fps, (width, height))
@@ -304,15 +332,17 @@ def process_s3(payload: dict):
             if not ret:
                 break
             if frame_count % vid_stride == 0:  # Process every vid_stride frame
-                results = model(frame, imgsz=imgsz)
+                results = model.track(source=frame, imgsz=imgsz, conf=0.25, iou=0.4, verbose=False)
                 annotated_frame = process_frame(frame, results)
                 out.write(annotated_frame)
+                if results[0].boxes.xyxy.numel() > 0:
+                    logger.info(f"Processed frame {frame_count} with {results[0].boxes.xyxy.shape[0]} detections")
             else:
                 out.write(frame)  # Write unprocessed frame to maintain video length
             frame_count += 1
         cap.release()
         out.release()
-        logger.info(f"Frame-by-frame processing with YOLO and OpenCV completed for {frame_count} frames")
+        logger.info(f"Frame-by-frame processing with YOLO tracking and OpenCV completed for {frame_count} frames")
         produced = out_path
         if not produced.exists():
             logger.error("Processed video not found")
