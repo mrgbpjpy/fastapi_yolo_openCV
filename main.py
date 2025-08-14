@@ -1,99 +1,57 @@
-from fastapi import FastAPI, File, UploadFile, HTTPException, BackgroundTasks
-from fastapi.responses import FileResponse, JSONResponse
-from fastapi.middleware.cors import CORSMiddleware
-from tempfile import NamedTemporaryFile
-import os
+from fastapi import FastAPI, UploadFile, File
+from fastapi.responses import JSONResponse, StreamingResponse
 import cv2
+import tempfile
+import torch
+import os
 
 app = FastAPI()
 
-# Allow frontend CORS
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["http://localhost:3000", "https://7ddd95.csb.app/"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+yolo_model = None  # Global, lazy-loaded
 
-# Healthcheck endpoint - responds instantly
 @app.get("/health")
 def health():
     return JSONResponse({"status": "ok"})
 
-# Lazy model load (None until first request)
-model = None
+@app.post("/process_video")
+async def process_video(file: UploadFile = File(...)):
+    global yolo_model
 
-def remove_file(path: str):
-    try:
-        os.remove(path)
-    except FileNotFoundError:
-        pass
-
-@app.post("/upload_video")
-def upload_video(background_tasks: BackgroundTasks, file: UploadFile = File(...)):
-    global model
-    if model is None:
+    # Lazy load YOLO model
+    if yolo_model is None:
         from ultralytics import YOLO
-        model = YOLO("yolov8n.pt")
-        print("YOLO model loaded.")
+        yolo_model = YOLO("yolov8n.pt")  # Use yolov8n for speed
 
-    # Validate file extension
-    if not file.filename.lower().endswith(('.mp4', '.avi', '.mov')):
-        raise HTTPException(status_code=400, detail="Invalid video file format")
+    # Save uploaded video temporarily
+    temp_in = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
+    temp_in.write(await file.read())
+    temp_in.close()
 
-    # Save uploaded file to temp path
-    input_temp = NamedTemporaryFile(delete=False, suffix=os.path.splitext(file.filename)[1] or ".mp4")
-    try:
-        contents = file.file.read()
-        input_temp.write(contents)
-        input_temp.close()
-        input_path = input_temp.name
-    finally:
-        file.file.close()
+    # Output temp file
+    temp_out = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
+    temp_out.close()
 
-    # Open video file
-    cap = cv2.VideoCapture(input_path, cv2.CAP_FFMPEG)
-    if not cap.isOpened():
-        os.remove(input_path)
-        raise HTTPException(status_code=500, detail="Error opening video file")
+    # OpenCV Video Read
+    cap = cv2.VideoCapture(temp_in.name)
+    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+    out = cv2.VideoWriter(temp_out.name, fourcc, cap.get(cv2.CAP_PROP_FPS),
+                          (int(cap.get(3)), int(cap.get(4))))
 
-    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    fps = cap.get(cv2.CAP_PROP_FPS) or 24.0
-    if width <= 0 or height <= 0:
-        cap.release()
-        os.remove(input_path)
-        raise HTTPException(status_code=500, detail="Invalid video dimensions")
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
 
-    output_temp = NamedTemporaryFile(delete=False, suffix=".mp4")
-    output_temp.close()
-    output_path = output_temp.name
+        # Run YOLO
+        results = yolo_model(frame)
 
-    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-    out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
-    if not out.isOpened():
-        cap.release()
-        os.remove(input_path)
-        raise HTTPException(status_code=500, detail="Error initializing video writer")
+        # Draw detections
+        annotated_frame = results[0].plot()
+        out.write(annotated_frame)
 
-    frame_count = 0
-    try:
-        while True:
-            ret, frame = cap.read()
-            if not ret:
-                break
-            results = model.track(frame, persist=True)
-            annotated = results[0].plot()
-            out.write(annotated)
-            frame_count += 1
+    cap.release()
+    out.release()
 
-        if frame_count == 0:
-            raise RuntimeError("No frames processed")
-    finally:
-        cap.release()
-        out.release()
-        os.remove(input_path)
+    # Return annotated video
+    return StreamingResponse(open(temp_out.name, "rb"), media_type="video/mp4")
 
-    background_tasks.add_task(remove_file, output_path)
-    return FileResponse(output_path, media_type="video/mp4", filename="processed_video.mp4")
