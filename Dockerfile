@@ -15,9 +15,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 COPY requirements.txt .
 
-# Upgrade build tooling first, then install from CPU index
-RUN python -m pip install --upgrade pip setuptools wheel \
- && pip install --no-cache-dir -r requirements.txt
+# Upgrade tooling first
+RUN python -m pip install --upgrade pip setuptools wheel
+
+# Install Torch/TV first (helps diagnose wheel issues)
+RUN pip install --no-cache-dir --extra-index-url https://download.pytorch.org/whl/cpu \
+    torch==2.3.1+cpu torchvision==0.18.1+cpu
+
+# Install the rest
+RUN pip install --no-cache-dir -r requirements.txt && pip cache purge
 
 COPY . .
 
