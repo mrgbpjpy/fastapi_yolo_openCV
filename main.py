@@ -8,12 +8,15 @@ from ultralytics import YOLO
 
 app = FastAPI()
 
-# Healthcheck for Railway
+# Global model placeholder (lazy load)
+model = None
+
+# Healthcheck endpoint
 @app.get("/health")
 def health():
     return JSONResponse({"status": "ok"})
 
-# CORS
+# CORS configuration
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
@@ -25,9 +28,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Load YOLO model once
-model = YOLO("yolov8n.pt")
-
 def remove_file(path: str):
     """Background task to clean up temporary files."""
     try:
@@ -37,11 +37,21 @@ def remove_file(path: str):
 
 @app.post("/upload_video")
 def upload_video(background_tasks: BackgroundTasks, file: UploadFile = File(...)):
+    global model
+
+    # Lazy-load YOLO model to avoid slowing startup
+    if model is None:
+        try:
+            model = YOLO("yolov8n.pt")
+            print("YOLO model loaded successfully.")
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Error loading YOLO model: {e}")
+
     # Validate extension
     if not file.filename.lower().endswith(('.mp4', '.avi', '.mov')):
         raise HTTPException(status_code=400, detail="Invalid video file format")
 
-    # Save input temp file
+    # Save uploaded file to temp path
     input_temp = NamedTemporaryFile(delete=False, suffix=os.path.splitext(file.filename)[1] or ".mp4")
     try:
         contents = file.file.read()
@@ -68,12 +78,12 @@ def upload_video(background_tasks: BackgroundTasks, file: UploadFile = File(...)
         os.remove(input_path)
         raise HTTPException(status_code=500, detail="Invalid video dimensions")
 
-    # Output file
+    # Create output temp file
     output_temp = NamedTemporaryFile(delete=False, suffix=".mp4")
     output_temp.close()
     output_path = output_temp.name
 
-    # Use mp4v for broad CPU-only compatibility
+    # Use mp4v for CPU compatibility
     fourcc = cv2.VideoWriter_fourcc(*'mp4v')
     out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
     if not out.isOpened():
@@ -102,7 +112,9 @@ def upload_video(background_tasks: BackgroundTasks, file: UploadFile = File(...)
         out.release()
         os.remove(input_path)
 
+    # Schedule cleanup of output file
     background_tasks.add_task(remove_file, output_path)
+
     return FileResponse(
         output_path,
         media_type="video/mp4",
