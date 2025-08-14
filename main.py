@@ -19,7 +19,7 @@ app = FastAPI()
 # Add CORS middleware: https://fastapi.tiangolo.com/tutorial/cors/#use-corsmiddleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000"],
+    allow_origins=["http://localhost:3000","https://7ddd95.csb.app/"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
