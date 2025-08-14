@@ -78,23 +78,27 @@ def get_model():
 # ---------- video endpoint (Ultralytics pipeline) ----------
 @app.post("/upload_video")
 def upload_video(file: UploadFile = File(...)):
-    # Basic filename check
+    import cv2  # lazy import keeps startup instant
+
+    # --- light validation ---
     name = (file.filename or "video.mp4")
     lower = name.lower()
     if not lower.endswith((".mp4", ".mov", ".avi", ".mkv")):
         raise HTTPException(400, "Invalid video file format")
 
-    # Work in a throwaway directory and then move the result to a stable temp path
+    # --- temp IO setup ---
+    from tempfile import TemporaryDirectory
+    from pathlib import Path
+    import shutil
+
     with TemporaryDirectory() as workdir:
         work = Path(workdir)
         in_dir = work / "input"
-        out_dir = work / "runs"
         in_dir.mkdir(parents=True, exist_ok=True)
-
         in_path = in_dir / name
+
         try:
-            in_bytes = file.file.read()
-            in_path.write_bytes(in_bytes)
+            in_path.write_bytes(file.file.read())
         except Exception as e:
             raise HTTPException(500, f"Error saving upload: {e}")
         finally:
@@ -103,46 +107,79 @@ def upload_video(file: UploadFile = File(...)):
             except Exception:
                 pass
 
-        model = get_model()
+        # --- open input to fetch video properties ---
+        cap = cv2.VideoCapture(str(in_path), cv2.CAP_FFMPEG)
+        if not cap.isOpened():
+            raise HTTPException(500, "Error opening video file")
 
-        # Use Ultralytics' internal video IO for speed; force ByteTrack to avoid lapx
+        w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        fps = cap.get(cv2.CAP_PROP_FPS) or 24.0
+        cap.release()
+        if w <= 0 or h <= 0:
+            raise HTTPException(500, "Invalid video dimensions")
+
+        # --- writer (CPU-friendly mp4v) ---
+        out_tmp_dir = Path(TemporaryDirectory().name)
+        out_tmp_dir.mkdir(parents=True, exist_ok=True)
+        out_path = out_tmp_dir / "processed_video.mp4"
+        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+        out = cv2.VideoWriter(str(out_path), fourcc, fps, (w, h))
+        if not out.isOpened():
+            raise HTTPException(500, "Error initializing video writer")
+
+        # --- tracking (stream) ---
+        model = get_model()
+        frames = 0
         try:
-            model.track(
+            # stream=True prevents RAM buildup; persist=True keeps track IDs
+            for r in model.track(
                 source=str(in_path),
-                save=True,               # write annotated video to disk
-                stream=False,            # run to completion
-                project=str(out_dir),    # base output dir
-                name="out",              # subfolder
-                exist_ok=True,
-                device="cpu",
-                tracker="bytetrack.yaml",# <- avoids lapx (OCSORT) dependency
-                imgsz=320,               # smaller -> faster CPU
-                vid_stride=2,            # process every 2nd frame
+                stream=True,
+                imgsz=320,               # speed knob (try 256 for faster)
+                vid_stride=2,            # process every other frame
                 conf=0.30,
                 iou=0.45,
+                device="cpu",
+                tracker="bytetrack.yaml",  # avoids lapx
+                persist=True,
                 verbose=False,
-            )
+            ):
+                # r.orig_img is the original frame (BGR), r.plot() draws boxes/labels
+                frame = r.plot()  # annotated with boxes & (sometimes) IDs
+
+                # ---- ensure IDs are visible: draw them ourselves if necessary ----
+                try:
+                    ids = r.boxes.id  # tensor of track IDs or None
+                    xyxy = r.boxes.xyxy  # (N, 4)
+                    if ids is not None and xyxy is not None:
+                        import numpy as np
+                        ids_np = ids.cpu().numpy().astype(int)
+                        boxes_np = xyxy.cpu().numpy().astype(int)
+                        for (x1, y1, x2, y2), tid in zip(boxes_np, ids_np):
+                            # label baseline above the box
+                            label = f"ID {tid}"
+                            # draw a filled background for readability
+                            cv2.rectangle(frame, (x1, max(0, y1 - 22)), (x1 + 90, y1), (0, 0, 0), -1)
+                            cv2.putText(frame, label, (x1 + 4, y1 - 6),
+                                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2, cv2.LINE_AA)
+                except Exception:
+                    # if anything goes wrong, we still write the plotted frame
+                    pass
+
+                out.write(frame)
+                frames += 1
+
+            if frames == 0:
+                raise RuntimeError("No frames processed (empty or unsupported video).")
         except Exception as e:
-            # If Ultralytics tries to auto-install, our env flag will prevent it and raise
             raise HTTPException(500, f"Error during tracking: {e}")
+        finally:
+            out.release()
 
-        # Locate output (Ultralytics mirrors input filename under runs/out/)
-        out_root = out_dir / "out"
-        candidates = []
-        for ext in ("*.mp4", "*.mov", "*.avi", "*.mkv"):
-            candidates += list(out_root.rglob(ext))
-        if not candidates:
-            raise HTTPException(500, "Failed to locate processed video output")
-        produced = candidates[0]
-
-        # Move to a stable temp file (outside context manager) so FileResponse can stream it
-        final_dir = Path(TemporaryDirectory().name)
-        final_dir.mkdir(parents=True, exist_ok=True)
-        final_path = final_dir / "processed_video.mp4"
-        shutil.move(str(produced), final_path)
-
+    # --- return the produced file ---
     return FileResponse(
-        str(final_path),
+        str(out_path),
         media_type="video/mp4",
         filename="processed_video.mp4",
         headers={"Content-Disposition": "attachment; filename=processed_video.mp4"},
