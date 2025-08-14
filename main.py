@@ -34,6 +34,14 @@ import boto3
 # Docs: https://botocore.amazonaws.com/v1/documentation/api/latest/reference/config.html
 from botocore.config import Config
 
+# Import logging for detailed error tracking
+# Docs: https://docs.python.org/3/library/logging.html
+import logging
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
 # ---------- perf/safety knobs ----------
 
 # Set environment variable to disable Ultralytics autoinstall
@@ -81,6 +89,15 @@ S3_PREFIX = os.getenv("S3_PREFIX", "").strip("/")
 # Define function to check if R2 environment variables are set
 # Docs: https://docs.python.org/3/reference/compound_stmts.html#function
 def have_r2_env() -> bool:
+    env_vars = {
+        "R2_ENDPOINT_URL": R2_ENDPOINT_URL,
+        "R2_ACCESS_KEY_ID": R2_ACCESS_KEY_ID,
+        "R2_SECRET_ACCESS_KEY": R2_SECRET_ACCESS_KEY,
+        "R2_BUCKET": S3_BUCKET
+    }
+    missing = [k for k, v in env_vars.items() if not v]
+    if missing:
+        logger.error(f"Missing R2 environment variables: {missing}")
     return bool(R2_ENDPOINT_URL and R2_ACCESS_KEY_ID and R2_SECRET_ACCESS_KEY and S3_BUCKET)
 
 # Initialize global S3 client variable
@@ -96,20 +113,26 @@ def get_s3():
     global _s3
     if _s3 is None:
         if not have_r2_env():
+            logger.error("R2 environment not configured")
             raise HTTPException(
                 status_code=500,
                 detail="R2 is not configured. Missing one of: R2_ENDPOINT_URL, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY, R2_BUCKET",
             )
-        _s3 = boto3.client(
-            "s3",
-            endpoint_url=R2_ENDPOINT_URL,
-            aws_access_key_id=R2_ACCESS_KEY_ID,
-            aws_secret_access_key=R2_SECRET_ACCESS_KEY,
-            # Use path-style addressing for R2 compatibility
-            # Docs: https://boto3.amazonaws.com/v1/documentation/api/latest/reference/core/session.html
-            config=Config(signature_version="s3v4", s3={"addressing_style": "path"}),
-            region_name="auto",
-        )
+        try:
+            _s3 = boto3.client(
+                "s3",
+                endpoint_url=R2_ENDPOINT_URL,
+                aws_access_key_id=R2_ACCESS_KEY_ID,
+                aws_secret_access_key=R2_SECRET_ACCESS_KEY,
+                # Use path-style addressing for R2 compatibility
+                # Docs: https://boto3.amazonaws.com/v1/documentation/api/latest/reference/core/session.html
+                config=Config(signature_version="s3v4", s3={"addressing_style": "path"}),
+                region_name="auto",
+            )
+            logger.info(f"S3 client initialized for {R2_ENDPOINT_URL}")
+        except Exception as e:
+            logger.error(f"Failed to initialize S3 client: {e}")
+            raise HTTPException(status_code=500, detail=f"Failed to initialize S3 client: {e}")
     return _s3
 
 # Create FastAPI application instance
@@ -191,6 +214,7 @@ def get_model():
 @app.get("/presign-upload")
 def presign_upload(ext: str = "mp4", content_type: str = "video/mp4"):
     if not have_r2_env():
+        logger.error("R2 environment check failed")
         raise HTTPException(500, "R2 not configured on server")
     ext = (ext or "mp4").lower()
     if ext not in {"mp4", "mov", "avi", "mkv"}:
@@ -207,7 +231,9 @@ def presign_upload(ext: str = "mp4", content_type: str = "video/mp4"):
             },
             ExpiresIn=900,
         )
+        logger.info(f"Presigned URL generated for key: {key}")
     except Exception as e:
+        logger.error(f"Presign upload failed: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to presign upload: {e}")
     return {"uploadUrl": url, "key": key, "bucket": S3_BUCKET}
 
@@ -215,6 +241,7 @@ def presign_upload(ext: str = "mp4", content_type: str = "video/mp4"):
 @app.post("/process_s3")
 def process_s3(payload: dict):
     if not have_r2_env():
+        logger.error("R2 environment check failed")
         raise HTTPException(500, "R2 not configured on server")
     key = payload.get("key")
     if not key or not isinstance(key, str):
@@ -228,7 +255,9 @@ def process_s3(payload: dict):
         out_base = tmp / "runs"
         try:
             s3.download_file(S3_BUCKET, key, str(in_path))
+            logger.info(f"Downloaded file from R2: {key}")
         except Exception as e:
+            logger.error(f"Download from R2 failed: {e}")
             raise HTTPException(status_code=500, detail=f"Failed to download from R2: {e}")
         model = get_model()
         try:
@@ -247,7 +276,9 @@ def process_s3(payload: dict):
                 iou=0.45,
                 verbose=False,
             )
+            logger.info("YOLO tracking completed")
         except Exception as e:
+            logger.error(f"Tracking error: {e}")
             raise HTTPException(status_code=500, detail=f"Tracking error: {e}")
         out_root = out_base / "out"
         produced = None
@@ -257,11 +288,14 @@ def process_s3(payload: dict):
                 produced = found[0]
                 break
         if not produced:
+            logger.error("Processed video not found")
             raise HTTPException(status_code=500, detail="Processed video not found")
         processed_key = f"{S3_PREFIX + '/' if S3_PREFIX else ''}processed/{uuid.uuid4()}.mp4"
         try:
             s3.upload_file(str(produced), S3_BUCKET, processed_key, ExtraArgs={"ContentType": "video/mp4"})
+            logger.info(f"Uploaded processed file to R2: {processed_key}")
         except Exception as e:
+            logger.error(f"Upload to R2 failed: {e}")
             raise HTTPException(status_code=500, detail=f"Upload to R2 failed: {e}")
     try:
         get_url = s3.generate_presigned_url(
@@ -269,6 +303,8 @@ def process_s3(payload: dict):
             Params={"Bucket": S3_BUCKET, "Key": processed_key},
             ExpiresIn=3600,
         )
+        logger.info(f"Presigned GET URL generated for: {processed_key}")
     except Exception as e:
+        logger.error(f"Presign GET failed: {e}")
         raise HTTPException(status_code=500, detail=f"Presign GET failed: {e}")
     return {"videoUrl": get_url, "processedKey": processed_key}
