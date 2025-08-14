@@ -9,26 +9,23 @@ ENV PYTHONUNBUFFERED=1 \
 
 WORKDIR /app
 
-# OpenCV runtime libs
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libgl1 libglib2.0-0 \
  && rm -rf /var/lib/apt/lists/*
 
-# Copy reqs early to leverage layer cache
 COPY requirements.txt .
 
-# Show exact versions (helps confirm Py 3.10)
+# Prove the Python we’re building against, then upgrade build tooling
 RUN python -V && pip -V && python -m pip install --upgrade pip setuptools wheel
 
-# Install Torch/TV first from the CPU index (clearer errors if it fails)
+# Install Torch/TV first from the CPU wheel index (clearer errors)
 RUN pip install -v --no-cache-dir --extra-index-url https://download.pytorch.org/whl/cpu \
     torch==2.3.1+cpu \
     torchvision==0.18.1+cpu
 
-# Install the rest (verbose to surface the *first* real error)
+# Install the rest, verbose
 RUN pip install -v --no-cache-dir -r requirements.txt && pip cache purge
 
-# App files
 COPY . .
 
 EXPOSE 8000
