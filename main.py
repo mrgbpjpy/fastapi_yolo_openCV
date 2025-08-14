@@ -38,6 +38,14 @@ from botocore.config import Config
 # Docs: https://docs.python.org/3/library/logging.html
 import logging
 
+# Import cv2 for OpenCV frame processing
+# Docs: https://docs.opencv.org/4.x/
+import cv2
+
+# Import numpy for array operations
+# Docs: https://numpy.org/doc/stable/
+import numpy as np
+
 # Configure logging with INFO level
 # Docs: https://docs.python.org/3/library/logging.html#logging.basicConfig
 logging.basicConfig(level=logging.INFO)
@@ -171,7 +179,7 @@ def index():
         "prefix": S3_PREFIX,
     }
 
-# ---------- YOLO (lazy) ----------
+# ---------- YOLO and OpenCV Processing ----------
 
 # Initialize global YOLO model variable
 # Docs: https://docs.python.org/3/reference/simple_stmts.html#assignment
@@ -201,7 +209,7 @@ def get_model():
         except Exception:
             pass
         try:
-            # Import cv2 and set thread limits
+            # Import cv2 for OpenCV frame processing
             # Docs: https://docs.opencv.org/4.x/
             import cv2
             cv2.setNumThreads(1)
@@ -211,8 +219,25 @@ def get_model():
                 pass
         except Exception:
             pass
-        print("YOLO ready")
+        logger.info("YOLO model loaded and ready")
     return _model
+
+# Function to process each frame with YOLO and OpenCV
+# Docs: https://docs.python.org/3/reference/compound_stmts.html#function
+def process_frame(frame, results):
+    # Convert frame to numpy array if not already
+    # Docs: https://numpy.org/doc/stable/reference/arrays.html
+    frame = np.array(frame) if not isinstance(frame, np.ndarray) else frame
+    # Draw bounding boxes and labels from YOLO results
+    # Docs: https://docs.ultralytics.com/modes/predict/#working-with-results
+    for box in results[0].boxes.xyxy:  # Access the first result's boxes
+        x1, y1, x2, y2 = map(int, box[:4])
+        cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)  # Green box
+        conf = results[0].boxes.conf[0]  # Confidence score
+        cls = int(results[0].boxes.cls[0])  # Class ID
+        label = f"Class {cls} ({conf:.2f})"
+        cv2.putText(frame, label, (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+    return frame
 
 # 1) Presign a PUT for direct browser upload to R2
 @app.get("/presign-upload")
@@ -256,7 +281,7 @@ def process_s3(payload: dict):
     with TemporaryDirectory() as tmpd:
         tmp = Path(tmpd)
         in_path = tmp / "input.mp4"
-        out_base = tmp / "runs"
+        out_path = tmp / "output_annotated.mp4"
         try:
             s3.download_file(S3_BUCKET, key, str(in_path))
             logger.info(f"Downloaded file from R2: {key}")
@@ -264,34 +289,32 @@ def process_s3(payload: dict):
             logger.error(f"Download from R2 failed: {e}")
             raise HTTPException(status_code=500, detail=f"Failed to download from R2: {e}")
         model = get_model()
-        try:
-            model.track(
-                source=str(in_path),
-                save=True,
-                stream=False,
-                project=str(out_base),
-                name="out",
-                exist_ok=True,
-                device="cpu",
-                tracker="bytetrack.yaml",
-                imgsz=imgsz,
-                vid_stride=vid_stride,
-                conf=0.30,
-                iou=0.45,
-                verbose=False,
-            )
-            logger.info("YOLO tracking completed")
-        except Exception as e:
-            logger.error(f"Tracking error: {e}")
-            raise HTTPException(status_code=500, detail=f"Tracking error: {e}")
-        out_root = out_base / "out"
-        produced = None
-        for suf in (".mp4", ".mov", ".avi", ".mkv"):
-            found = list(out_root.rglob(f"*{suf}"))
-            if found:
-                produced = found[0]
+        cap = cv2.VideoCapture(str(in_path))
+        if not cap.isOpened():
+            logger.error("Failed to open video file")
+            raise HTTPException(status_code=500, detail="Failed to open video file")
+        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        out = cv2.VideoWriter(str(out_path), fourcc, fps, (width, height))
+        frame_count = 0
+        while cap.isOpened():
+            ret, frame = cap.read()
+            if not ret:
                 break
-        if not produced:
+            if frame_count % vid_stride == 0:  # Process every vid_stride frame
+                results = model(frame, imgsz=imgsz)
+                annotated_frame = process_frame(frame, results)
+                out.write(annotated_frame)
+            else:
+                out.write(frame)  # Write unprocessed frame to maintain video length
+            frame_count += 1
+        cap.release()
+        out.release()
+        logger.info(f"Frame-by-frame processing with YOLO and OpenCV completed for {frame_count} frames")
+        produced = out_path
+        if not produced.exists():
             logger.error("Processed video not found")
             raise HTTPException(status_code=500, detail="Processed video not found")
         processed_key = f"{S3_PREFIX + '/' if S3_PREFIX else ''}processed/{uuid.uuid4()}.mp4"
