@@ -3,7 +3,7 @@
 fastapi==0.116.1
 uvicorn[standard]==0.33.0
 
-# CPU Torch/TV that have wheels for Py 3.10
+# CPU Torch/TV for Py 3.10
 torch==2.3.1+cpu
 torchvision==0.18.1+cpu
 
