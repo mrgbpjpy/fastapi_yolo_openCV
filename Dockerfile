@@ -9,23 +9,34 @@ ENV PYTHONUNBUFFERED=1 \
 
 WORKDIR /app
 
+# Minimal libs for OpenCV runtime
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libgl1 libglib2.0-0 \
  && rm -rf /var/lib/apt/lists/*
 
+# Copy reqs early for caching
 COPY requirements.txt .
 
-# Prove the Python we’re building against, then upgrade build tooling
-RUN python -V && pip -V && python -m pip install --upgrade pip setuptools wheel
+# Prove Python & pip versions in the build log
+RUN echo "=== PYTHON/PIP VERSIONS ===" \
+ && python -V && pip -V \
+ && python -m pip install --upgrade pip setuptools wheel
 
-# Install Torch/TV first from the CPU wheel index (clearer errors)
-RUN pip install -v --no-cache-dir --extra-index-url https://download.pytorch.org/whl/cpu \
-    torch==2.3.1+cpu \
-    torchvision==0.18.1+cpu
+# Show exactly which requirements are being used
+RUN echo "=== REQUIREMENTS CONTENTS ===" && cat requirements.txt
 
-# Install the rest, verbose
-RUN pip install -v --no-cache-dir -r requirements.txt && pip cache purge
+# Install Torch + Torchvision first from CPU wheel index (clearer errors if they fail)
+RUN echo "=== INSTALL TORCH/TV (CPU) ===" \
+ && pip install -v --no-cache-dir --extra-index-url https://download.pytorch.org/whl/cpu \
+      torch==2.3.1+cpu \
+      torchvision==0.18.1+cpu
 
+# Install the rest (verbose)
+RUN echo "=== INSTALL REST OF REQUIREMENTS ===" \
+ && pip install -v --no-cache-dir -r requirements.txt \
+ && pip cache purge
+
+# Copy the app
 COPY . .
 
 EXPOSE 8000
