@@ -1,43 +1,34 @@
 # -*- coding: utf-8 -*-
 """
-FastAPI + R2 (S3-compatible) video pipeline:
-- Presign PUT for direct upload from browser (signs exact Content-Type)
-- Download uploaded object
-- Run YOLO per-frame overlays (predict, no tracker)
-- Produce web-safe MP4 (H.264 + AAC + faststart); inject silent AAC if needed
-- Upload processed object to R2 with correct metadata
-- Return either public r2.dev URL or presigned GET (inline, video/mp4)
+FastAPI + R2 video pipeline (FFmpeg REQUIRED):
+- Presign PUT (signs exact Content-Type)
+- Download object
+- YOLO overlays (predict)
+- Transcode to H.264 + AAC + faststart (or inject silent AAC)
+- Upload and return URL
 """
-
-import os
-import uuid
-import logging
-import subprocess
+import os, uuid, logging, subprocess
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Optional, Tuple
 
 import boto3
 from botocore.config import Config
-
-import cv2
-import numpy as np
+import cv2, numpy as np
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
-# ---------- logging & perf knobs ----------
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("main")
 
 os.environ.setdefault("ULTRALYTICS_NOAUTOINSTALL", "1")
-os.environ.setdefault("ULTRALYTICS_IGNORE_REQUIREMENTS", "1")  # <- avoid runtime installs
+os.environ.setdefault("ULTRALYTICS_IGNORE_REQUIREMENTS", "1")
 os.environ.setdefault("OMP_NUM_THREADS", "1")
 os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
 os.environ.setdefault("MKL_NUM_THREADS", "1")
 os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
 
-# ---------- R2 / S3 config ----------
 R2_ENDPOINT_URL = os.getenv("R2_ENDPOINT_URL", "").rstrip("/")
 R2_ACCESS_KEY_ID = os.getenv("R2_ACCESS_KEY_ID")
 R2_SECRET_ACCESS_KEY = os.getenv("R2_SECRET_ACCESS_KEY")
@@ -56,6 +47,19 @@ def have_r2_env() -> bool:
         }.items() if not v]
         logger.error("Missing R2 env: %s", missing)
     return ok
+
+def have_ffmpeg() -> bool:
+    try:
+        a = subprocess.run(["ffmpeg", "-version"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        b = subprocess.run(["ffprobe", "-version"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return a.returncode == 0 and b.returncode == 0
+    except Exception:
+        return False
+
+# Fail early if ffmpeg is not present (prevents uploading unplayable files)
+FFMPEG_OK = have_ffmpeg()
+if not FFMPEG_OK:
+    logger.error("FFmpeg is NOT available in this container. Install it or use a base image that includes ffmpeg.")
 
 _s3 = None
 def get_s3():
@@ -78,7 +82,6 @@ def get_s3():
             raise HTTPException(500, f"Failed to initialize S3 client: {e}")
     return _s3
 
-# ---------- FastAPI ----------
 app = FastAPI(title="YOLOv8 Large Video Pipeline")
 
 app.add_middleware(
@@ -96,7 +99,12 @@ app.add_middleware(
 
 @app.get("/health")
 def health():
-    return JSONResponse({"status": "ok", "r2_configured": have_r2_env(), "bucket": S3_BUCKET})
+    return JSONResponse({
+        "status": "ok",
+        "r2_configured": have_r2_env(),
+        "ffmpeg": FFMPEG_OK,
+        "bucket": S3_BUCKET
+    })
 
 @app.get("/")
 def index():
@@ -104,12 +112,12 @@ def index():
         "ok": True,
         "routes": [getattr(r, "path", str(r)) for r in app.router.routes],
         "r2_configured": have_r2_env(),
+        "ffmpeg": FFMPEG_OK,
         "bucket": S3_BUCKET,
         "prefix": S3_PREFIX,
         "public_base": R2_PUBLIC_BASE or None,
     }
 
-# ---------- YOLO ----------
 _model = None
 def get_model():
     global _model
@@ -153,18 +161,9 @@ def draw_boxes(frame: np.ndarray, results) -> np.ndarray:
             label = f"{name} ({conf:.2f})"
             cv2.rectangle(f, (x1, y1), (x2, y2), (0, 255, 0), 2)
             (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 2)
-            cv2.rectangle(f, (x1, y1 - th - 8), (x1 + tw + 6, y1), (0, 0, 0), -1)  # <- fixed tuple
+            cv2.rectangle(f, (x1, y1 - th - 8), (x1 + tw + 6, y1), (0, 0, 0), -1)
             cv2.putText(f, label, (x1 + 2, y1 - 4), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
     return f
-
-# ---------- FFmpeg helpers ----------
-def have_ffmpeg() -> bool:
-    try:
-        subprocess.run(["ffmpeg", "-version"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
-        subprocess.run(["ffprobe", "-version"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
-        return True
-    except Exception:
-        return False
 
 def _has_audio(inp: Path) -> bool:
     try:
@@ -177,12 +176,6 @@ def _has_audio(inp: Path) -> bool:
         return False
 
 def ffmpeg_h264_faststart(inp: Path, out: Path) -> Tuple[bool, Optional[str]]:
-    """
-    Produce a browser-safe MP4:
-    - H.264 (yuv420p) baseline, level 3.0
-    - AAC audio; inject silent AAC if missing
-    - moov at front (+faststart)
-    """
     if _has_audio(inp):
         cmd = [
             "ffmpeg","-y","-i",str(inp),
@@ -208,7 +201,6 @@ def ffmpeg_h264_faststart(inp: Path, out: Path) -> Tuple[bool, Optional[str]]:
     ok = (r.returncode == 0) and out.exists() and out.stat().st_size > 0
     return ok, (r.stderr or r.stdout)
 
-# ---------- API: presign PUT ----------
 @app.get("/presign-upload")
 def presign_upload(ext: str = "mp4", content_type: str = "video/mp4"):
     if not have_r2_env():
@@ -231,11 +223,14 @@ def presign_upload(ext: str = "mp4", content_type: str = "video/mp4"):
         logger.exception("Presign PUT failed")
         raise HTTPException(500, f"Failed to presign upload: {e}")
 
-# ---------- API: process ----------
 @app.post("/process_s3")
 def process_s3(payload: dict):
     if not have_r2_env():
         raise HTTPException(500, "R2 not configured on server")
+    if not FFMPEG_OK:
+        # hard fail so the frontend shows a useful message
+        raise HTTPException(500, "FFmpeg is not installed in this container; video would be unplayable without it.")
+
     key = payload.get("key")
     if not key or not isinstance(key, str):
         raise HTTPException(400, "Missing S3 key")
@@ -250,7 +245,6 @@ def process_s3(payload: dict):
         ocv_path = tmp / "ocv_out.mp4"
         web_path = tmp / "web_out.mp4"
 
-        # 1) download uploaded object
         try:
             s3.download_file(S3_BUCKET, key, str(src_path))
             logger.info("Downloaded from R2: %s", key)
@@ -258,7 +252,6 @@ def process_s3(payload: dict):
             logger.exception("Download failed")
             raise HTTPException(500, f"Failed to download from R2: {e}")
 
-        # 2) YOLO overlay using predict (no tracker / no lapx)
         model = get_model()
         cap = cv2.VideoCapture(str(src_path))
         if not cap.isOpened():
@@ -283,23 +276,16 @@ def process_s3(payload: dict):
         out.release()
         logger.info("Frame processing done: %d frames", frame_count)
 
-        # 3) web-safe via FFmpeg (H.264/AAC faststart)
-        final_path = ocv_path
-        if have_ffmpeg():
-            ok, log = ffmpeg_h264_faststart(ocv_path, web_path)
-            if ok:
-                final_path = web_path
-                logger.info("FFmpeg produced web-safe MP4 (%s)", web_path.name)
-            else:
-                logger.warning("FFmpeg failed; using OpenCV file. log: %s", (log or "")[:4000])
-        else:
-            logger.warning("FFmpeg/ffprobe not available; using OpenCV file (may stall in browsers).")
+        ok, log = ffmpeg_h264_faststart(ocv_path, web_path)
+        logger.info("FFmpeg ran: %s", "OK" if ok else "FAILED")
+        if not ok:
+            logger.warning("FFmpeg log (truncated): %s", (log or "")[:2000])
+            raise HTTPException(500, "FFmpeg failed to produce a web-safe MP4.")
 
-        # 4) upload processed object
         processed_key = f"{S3_PREFIX + '/' if S3_PREFIX else ''}processed/{uuid.uuid4()}.mp4"
         try:
             s3.upload_file(
-                str(final_path),
+                str(web_path),
                 S3_BUCKET,
                 processed_key,
                 ExtraArgs={"ContentType": "video/mp4", "CacheControl": "public, max-age=3600"},
@@ -308,12 +294,10 @@ def process_s3(payload: dict):
         except Exception as e:
             logger.exception("Upload to R2 failed")
             raise HTTPException(500, f"Upload to R2 failed: {e}")
- 
-    # 5) playback URL
+
     try:
         if R2_PUBLIC_BASE:
-            public_url = f"{R2_PUBLIC_BASE}/{processed_key}"
-            return {"videoUrl": public_url, "processedKey": processed_key, "public": True}
+            return {"videoUrl": f"{R2_PUBLIC_BASE}/{processed_key}", "processedKey": processed_key, "public": True}
 
         get_url = s3.generate_presigned_url(
             ClientMethod="get_object",
