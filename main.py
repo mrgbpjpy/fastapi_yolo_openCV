@@ -155,7 +155,7 @@ app = FastAPI(title="YOLOv8 Large Video Pipeline")
 # Docs: https://fastapi.tiangolo.com/tutorial/cors/
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["https://7ddd95.csb.app", "http://localhost:3000"],
+    allow_origins=["https://7ddd95.csb.app", "http://localhost:3000","https://84fl4c.csb.app"],
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
