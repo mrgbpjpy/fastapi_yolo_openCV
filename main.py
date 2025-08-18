@@ -4,9 +4,9 @@ FastAPI + R2 (S3-compatible) video pipeline:
 - Presign PUT for direct upload from browser
 - Download uploaded object
 - Run YOLO per-frame overlays
-- Produce web-safe MP4 (H.264 + AAC + faststart) via FFmpeg
+- Produce web-safe MP4 (H.264 + AAC + faststart); inject silent AAC if needed
 - Upload processed object to R2 with correct metadata
-- Return presigned GET (inline, video/mp4)
+- Return either public r2.dev URL or presigned GET (inline, video/mp4)
 """
 
 import os
@@ -165,24 +165,60 @@ def draw_boxes(frame: np.ndarray, results) -> np.ndarray:
 def have_ffmpeg() -> bool:
     try:
         subprocess.run(["ffmpeg", "-version"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+        subprocess.run(["ffprobe", "-version"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
         return True
+    except Exception:
+        return False
+
+def _has_audio(inp: Path) -> bool:
+    """Return True if input has an audio stream (ffprobe)."""
+    try:
+        r = subprocess.run(
+            [
+                "ffprobe", "-v", "error",
+                "-select_streams", "a",
+                "-show_entries", "stream=index",
+                "-of", "csv=p=0", str(inp)
+            ],
+            capture_output=True, text=True, check=False
+        )
+        return bool(r.stdout.strip())
     except Exception:
         return False
 
 def ffmpeg_h264_faststart(inp: Path, out: Path) -> Tuple[bool, Optional[str]]:
     """
-    Transcode/remux to a browser-safe MP4:
-    - H.264 video (YUV420), AAC audio
-    - moov atom moved to front (-movflags +faststart)
+    Produce a browser-safe MP4:
+    - H.264 (yuv420p), baseline profile, level 3.0 (max compatibility)
+    - AAC audio; if missing, inject silent AAC (anullsrc)
+    - moov atom at front (-movflags +faststart)
     """
-    cmd = [
-        "ffmpeg", "-y", "-i", str(inp),
-        "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
-        "-pix_fmt", "yuv420p", "-profile:v", "baseline", "-level", "3.0",
-        "-movflags", "+faststart",
-        "-c:a", "aac", "-b:a", "128k", "-ac", "2",
-        str(out)
-    ]
+    if _has_audio(inp):
+        cmd = [
+            "ffmpeg", "-y", "-i", str(inp),
+            "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
+            "-pix_fmt", "yuv420p", "-profile:v", "baseline", "-level", "3.0",
+            "-movflags", "+faststart",
+            "-c:a", "aac", "-b:a", "128k", "-ac", "2",
+            "-shortest",
+            str(out)
+        ]
+    else:
+        # inject a silent stereo AAC track for iOS/Android
+        cmd = [
+            "ffmpeg", "-y",
+            "-i", str(inp),
+            "-f", "lavfi", "-t", "999999",
+            "-i", "anullsrc=channel_layout=stereo:sample_rate=44100",
+            "-map", "0:v:0", "-map", "1:a:0",
+            "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
+            "-pix_fmt", "yuv420p", "-profile:v", "baseline", "-level", "3.0",
+            "-movflags", "+faststart",
+            "-c:a", "aac", "-b:a", "128k", "-ac", "2",
+            "-shortest",
+            str(out)
+        ]
+
     try:
         r = subprocess.run(cmd, capture_output=True, text=True, check=False)
         ok = (r.returncode == 0) and out.exists() and out.stat().st_size > 0
@@ -248,7 +284,7 @@ def process_s3(payload: dict):
         width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 1280)
         height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 720)
 
-        # NOTE: OpenCV 'mp4v' often yields MPEG‑4 Part 2. We'll post-process with ffmpeg.
+        # NOTE: OpenCV 'mp4v' often yields MPEG-4 Part 2. We'll post-process with ffmpeg.
         fourcc = cv2.VideoWriter_fourcc(*"mp4v")
         out = cv2.VideoWriter(str(ocv_path), fourcc, float(fps), (width, height))
         frame_count = 0
@@ -265,7 +301,7 @@ def process_s3(payload: dict):
         out.release()
         logger.info("Frame processing done: %d frames", frame_count)
 
-        # 3) make web‑safe via FFmpeg (H.264/AAC + faststart)
+        # 3) make web-safe via FFmpeg (H.264/AAC + faststart); inject silent AAC if needed
         final_path = ocv_path
         if have_ffmpeg():
             ok, log = ffmpeg_h264_faststart(ocv_path, web_path)
@@ -275,7 +311,7 @@ def process_s3(payload: dict):
             else:
                 logger.warning("FFmpeg failed; using OpenCV file. log: %s", (log or "")[:4000])
         else:
-            logger.warning("FFmpeg not available; using OpenCV file (may not play in Chrome).")
+            logger.warning("FFmpeg/ffprobe not available; using OpenCV file (may stall in browsers).")
 
         # 4) upload processed object with correct metadata
         processed_key = f"{S3_PREFIX + '/' if S3_PREFIX else ''}processed/{uuid.uuid4()}.mp4"
@@ -298,7 +334,7 @@ def process_s3(payload: dict):
     try:
         if R2_PUBLIC_BASE:
             # If you’ve set your public site base (https://pub-XXXX.r2.dev),
-            # you can return a stable public URL.
+            # return a stable public URL.
             public_url = f"{R2_PUBLIC_BASE}/{processed_key}"
             return {"videoUrl": public_url, "processedKey": processed_key, "public": True}
 
