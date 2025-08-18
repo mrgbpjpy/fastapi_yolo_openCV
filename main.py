@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 FastAPI + R2 (S3-compatible) video pipeline:
-- Presign PUT for direct upload from browser
+- Presign PUT for direct upload from browser (signs exact Content-Type)
 - Download uploaded object
 - Run YOLO per-frame overlays
 - Produce web-safe MP4 (H.264 + AAC + faststart); inject silent AAC if needed
@@ -42,7 +42,6 @@ R2_ACCESS_KEY_ID = os.getenv("R2_ACCESS_KEY_ID")
 R2_SECRET_ACCESS_KEY = os.getenv("R2_SECRET_ACCESS_KEY")
 S3_BUCKET = os.getenv("R2_BUCKET") or os.getenv("S3_BUCKET")
 S3_PREFIX = os.getenv("S3_PREFIX", "").strip("/")
-# optional: public site base like https://pub-XXXX.r2.dev
 R2_PUBLIC_BASE = os.getenv("R2_PUBLIC_BASE", "").rstrip("/")
 
 def have_r2_env() -> bool:
@@ -116,21 +115,17 @@ def get_model():
     if _model is None:
         from ultralytics import YOLO
         _model = YOLO("yolov8n.pt")
-        try:
-            _model.fuse()
-        except Exception:
-            pass
+        try: _model.fuse()
+        except Exception: pass
         try:
             import torch
             torch.set_num_threads(1)
             torch.set_num_interop_threads(1)
-        except Exception:
-            pass
+        except Exception: pass
         try:
             cv2.setNumThreads(1)
             cv2.ocl.setUseOpenCL(False)
-        except Exception:
-            pass
+        except Exception: pass
         logger.info("YOLO model loaded")
     return _model
 
@@ -157,7 +152,7 @@ def draw_boxes(frame: np.ndarray, results) -> np.ndarray:
             label = f"{name} ({conf:.2f})"
             cv2.rectangle(f, (x1, y1), (x2, y2), (0,255,0), 2)
             (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 2)
-            cv2.rectangle(f, (x1, y1 - th - 8), (x1 + tw + 6, y1), (0,0,0), -1)
+            cv2.rectangle(f, (x1, y1 - th - 8), (x1 + tw + 6), (0,0,0), -1)
             cv2.putText(f, label, (x1 + 2, y1 - 4), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,255,0), 2)
     return f
 
@@ -171,60 +166,46 @@ def have_ffmpeg() -> bool:
         return False
 
 def _has_audio(inp: Path) -> bool:
-    """Return True if input has an audio stream (ffprobe)."""
     try:
         r = subprocess.run(
-            [
-                "ffprobe", "-v", "error",
-                "-select_streams", "a",
-                "-show_entries", "stream=index",
-                "-of", "csv=p=0", str(inp)
-            ],
-            capture_output=True, text=True, check=False
+            ["ffprobe","-v","error","-select_streams","a","-show_entries","stream=index","-of","csv=p=0",str(inp)],
+            capture_output=True,text=True,check=False
         )
         return bool(r.stdout.strip())
     except Exception:
         return False
 
-def ffmpeg_h264_faststart(inp: Path, out: Path) -> Tuple[bool, Optional[str]]:
+def ffmpeg_h264_faststart(inp: Path, out: Path):
     """
     Produce a browser-safe MP4:
-    - H.264 (yuv420p), baseline profile, level 3.0 (max compatibility)
-    - AAC audio; if missing, inject silent AAC (anullsrc)
-    - moov atom at front (-movflags +faststart)
+    - H.264 (yuv420p) baseline, level 3.0
+    - AAC audio; inject silent AAC if missing
+    - moov at front (+faststart)
     """
     if _has_audio(inp):
         cmd = [
-            "ffmpeg", "-y", "-i", str(inp),
-            "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
-            "-pix_fmt", "yuv420p", "-profile:v", "baseline", "-level", "3.0",
-            "-movflags", "+faststart",
-            "-c:a", "aac", "-b:a", "128k", "-ac", "2",
-            "-shortest",
-            str(out)
+            "ffmpeg","-y","-i",str(inp),
+            "-c:v","libx264","-preset","veryfast","-crf","23",
+            "-pix_fmt","yuv420p","-profile:v","baseline","-level","3.0",
+            "-movflags","+faststart",
+            "-c:a","aac","-b:a","128k","-ac","2",
+            "-shortest", str(out)
         ]
     else:
-        # inject a silent stereo AAC track for iOS/Android
         cmd = [
-            "ffmpeg", "-y",
-            "-i", str(inp),
-            "-f", "lavfi", "-t", "999999",
-            "-i", "anullsrc=channel_layout=stereo:sample_rate=44100",
-            "-map", "0:v:0", "-map", "1:a:0",
-            "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
-            "-pix_fmt", "yuv420p", "-profile:v", "baseline", "-level", "3.0",
-            "-movflags", "+faststart",
-            "-c:a", "aac", "-b:a", "128k", "-ac", "2",
-            "-shortest",
-            str(out)
+            "ffmpeg","-y",
+            "-i",str(inp),
+            "-f","lavfi","-t","999999","-i","anullsrc=channel_layout=stereo:sample_rate=44100",
+            "-map","0:v:0","-map","1:a:0",
+            "-c:v","libx264","-preset","veryfast","-crf","23",
+            "-pix_fmt","yuv420p","-profile:v","baseline","-level","3.0",
+            "-movflags","+faststart",
+            "-c:a","aac","-b:a","128k","-ac","2",
+            "-shortest", str(out)
         ]
-
-    try:
-        r = subprocess.run(cmd, capture_output=True, text=True, check=False)
-        ok = (r.returncode == 0) and out.exists() and out.stat().st_size > 0
-        return ok, (r.stderr or r.stdout)
-    except Exception as e:
-        return False, str(e)
+    r = subprocess.run(cmd, capture_output=True, text=True, check=False)
+    ok = (r.returncode == 0) and out.exists() and out.stat().st_size > 0
+    return ok, (r.stderr or r.stdout)
 
 # ---------- API: presign PUT ----------
 @app.get("/presign-upload")
@@ -234,6 +215,7 @@ def presign_upload(ext: str = "mp4", content_type: str = "video/mp4"):
     ext = (ext or "mp4").lower()
     if ext not in {"mp4", "mov", "avi", "mkv"}:
         raise HTTPException(400, "Unsupported video extension")
+
     key = f"{S3_PREFIX + '/' if S3_PREFIX else ''}uploads/{uuid.uuid4()}.{ext}"
     s3 = get_s3()
     try:
@@ -242,7 +224,7 @@ def presign_upload(ext: str = "mp4", content_type: str = "video/mp4"):
             Params={"Bucket": S3_BUCKET, "Key": key, "ContentType": content_type},
             ExpiresIn=900,
         )
-        logger.info("Presigned PUT for %s", key)
+        logger.info("Presigned PUT for %s (ct=%s)", key, content_type)
         return {"uploadUrl": url, "key": key, "bucket": S3_BUCKET}
     except Exception as e:
         logger.exception("Presign PUT failed")
@@ -264,8 +246,8 @@ def process_s3(payload: dict):
     with TemporaryDirectory() as tmpd:
         tmp = Path(tmpd)
         src_path = tmp / "input.mp4"
-        ocv_path = tmp / "ocv_out.mp4"         # first pass (OpenCV writer)
-        web_path = tmp / "web_out.mp4"         # final web-safe file
+        ocv_path = tmp / "ocv_out.mp4"
+        web_path = tmp / "web_out.mp4"
 
         # 1) download uploaded object
         try:
@@ -275,7 +257,7 @@ def process_s3(payload: dict):
             logger.exception("Download failed")
             raise HTTPException(500, f"Failed to download from R2: {e}")
 
-        # 2) run YOLO overlay, write via OpenCV
+        # 2) YOLO overlay
         model = get_model()
         cap = cv2.VideoCapture(str(src_path))
         if not cap.isOpened():
@@ -284,7 +266,6 @@ def process_s3(payload: dict):
         width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 1280)
         height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 720)
 
-        # NOTE: OpenCV 'mp4v' often yields MPEG-4 Part 2. We'll post-process with ffmpeg.
         fourcc = cv2.VideoWriter_fourcc(*"mp4v")
         out = cv2.VideoWriter(str(ocv_path), fourcc, float(fps), (width, height))
         frame_count = 0
@@ -301,7 +282,7 @@ def process_s3(payload: dict):
         out.release()
         logger.info("Frame processing done: %d frames", frame_count)
 
-        # 3) make web-safe via FFmpeg (H.264/AAC + faststart); inject silent AAC if needed
+        # 3) web-safe via FFmpeg (H.264/AAC faststart)
         final_path = ocv_path
         if have_ffmpeg():
             ok, log = ffmpeg_h264_faststart(ocv_path, web_path)
@@ -313,32 +294,26 @@ def process_s3(payload: dict):
         else:
             logger.warning("FFmpeg/ffprobe not available; using OpenCV file (may stall in browsers).")
 
-        # 4) upload processed object with correct metadata
+        # 4) upload processed object
         processed_key = f"{S3_PREFIX + '/' if S3_PREFIX else ''}processed/{uuid.uuid4()}.mp4"
         try:
             s3.upload_file(
                 str(final_path),
                 S3_BUCKET,
                 processed_key,
-                ExtraArgs={
-                    "ContentType": "video/mp4",
-                    "CacheControl": "public, max-age=3600",
-                },
+                ExtraArgs={"ContentType": "video/mp4", "CacheControl": "public, max-age=3600"},
             )
             logger.info("Uploaded processed file: %s", processed_key)
         except Exception as e:
             logger.exception("Upload to R2 failed")
             raise HTTPException(500, f"Upload to R2 failed: {e}")
 
-    # 5) return playback URL
+    # 5) playback URL
     try:
         if R2_PUBLIC_BASE:
-            # If you’ve set your public site base (https://pub-XXXX.r2.dev),
-            # return a stable public URL.
             public_url = f"{R2_PUBLIC_BASE}/{processed_key}"
             return {"videoUrl": public_url, "processedKey": processed_key, "public": True}
 
-        # Otherwise, return presigned GET with inline/video headers
         get_url = s3.generate_presigned_url(
             ClientMethod="get_object",
             Params={
