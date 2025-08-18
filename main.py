@@ -3,7 +3,7 @@
 FastAPI + R2 (S3-compatible) video pipeline:
 - Presign PUT for direct upload from browser (signs exact Content-Type)
 - Download uploaded object
-- Run YOLO per-frame overlays
+- Run YOLO per-frame overlays (predict, no tracker)
 - Produce web-safe MP4 (H.264 + AAC + faststart); inject silent AAC if needed
 - Upload processed object to R2 with correct metadata
 - Return either public r2.dev URL or presigned GET (inline, video/mp4)
@@ -31,6 +31,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("main")
 
 os.environ.setdefault("ULTRALYTICS_NOAUTOINSTALL", "1")
+os.environ.setdefault("ULTRALYTICS_IGNORE_REQUIREMENTS", "1")  # <- avoid runtime installs
 os.environ.setdefault("OMP_NUM_THREADS", "1")
 os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
 os.environ.setdefault("MKL_NUM_THREADS", "1")
@@ -150,10 +151,10 @@ def draw_boxes(frame: np.ndarray, results) -> np.ndarray:
             idx = int(cls)
             name = COCO[idx] if 0 <= idx < len(COCO) else f"cls_{idx}"
             label = f"{name} ({conf:.2f})"
-            cv2.rectangle(f, (x1, y1), (x2, y2), (0,255,0), 2)
+            cv2.rectangle(f, (x1, y1), (x2, y2), (0, 255, 0), 2)
             (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 2)
-            cv2.rectangle(f, (x1, y1 - th - 8), (x1 + tw + 6), (0,0,0), -1)
-            cv2.putText(f, label, (x1 + 2, y1 - 4), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,255,0), 2)
+            cv2.rectangle(f, (x1, y1 - th - 8), (x1 + tw + 6, y1), (0, 0, 0), -1)  # <- fixed tuple
+            cv2.putText(f, label, (x1 + 2, y1 - 4), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
     return f
 
 # ---------- FFmpeg helpers ----------
@@ -169,13 +170,13 @@ def _has_audio(inp: Path) -> bool:
     try:
         r = subprocess.run(
             ["ffprobe","-v","error","-select_streams","a","-show_entries","stream=index","-of","csv=p=0",str(inp)],
-            capture_output=True,text=True,check=False
+            capture_output=True, text=True, check=False
         )
         return bool(r.stdout.strip())
     except Exception:
         return False
 
-def ffmpeg_h264_faststart(inp: Path, out: Path):
+def ffmpeg_h264_faststart(inp: Path, out: Path) -> Tuple[bool, Optional[str]]:
     """
     Produce a browser-safe MP4:
     - H.264 (yuv420p) baseline, level 3.0
@@ -257,7 +258,7 @@ def process_s3(payload: dict):
             logger.exception("Download failed")
             raise HTTPException(500, f"Failed to download from R2: {e}")
 
-        # 2) YOLO overlay
+        # 2) YOLO overlay using predict (no tracker / no lapx)
         model = get_model()
         cap = cv2.VideoCapture(str(src_path))
         if not cap.isOpened():
@@ -274,7 +275,7 @@ def process_s3(payload: dict):
             if not ok:
                 break
             if frame_count % max(1, vid_stride) == 0:
-                results = model.track(source=frame, imgsz=imgsz, conf=0.25, iou=0.4, verbose=False)
+                results = model.predict(source=frame, imgsz=imgsz, conf=0.25, iou=0.4, verbose=False)
                 frame = draw_boxes(frame, results)
             out.write(frame)
             frame_count += 1
