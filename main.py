@@ -308,7 +308,7 @@ def process_s3(payload: dict):
         except Exception as e:
             logger.exception("Upload to R2 failed")
             raise HTTPException(500, f"Upload to R2 failed: {e}")
-
+ 
     # 5) playback URL
     try:
         if R2_PUBLIC_BASE:
